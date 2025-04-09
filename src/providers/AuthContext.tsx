@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useCallback, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSpotifyActions } from "./SpotifyContext/SpotifyContext";
 
@@ -17,21 +17,15 @@ export const LoggedInState = Symbol("Logged In State");
 
 export const LoggedOutState = Symbol("Logged Out State");
 
+// Add new state for client credentials only (browse-only mode)
+export const BrowseOnlyState = Symbol("Browse Only State");
+
 type AuthState =
   | typeof LoggedInState
   | typeof LoggedOutState
   | typeof LoadingState
-  | typeof UnknownState;
-
-const AuthStateContext = React.createContext<AuthState>(UnknownState);
-
-export const useAuthState = (): AuthState => {
-  const context = React.useContext(AuthStateContext);
-  if (!context) {
-    throw Error("Attempted to use AuthState without a provider!");
-  }
-  return context;
-};
+  | typeof UnknownState
+  | typeof BrowseOnlyState;
 
 /**
  * Auth Tokens
@@ -46,42 +40,71 @@ const ZeroTokens = {
   refresh_token: null,
 };
 
-const AuthTokenContext = React.createContext<AuthTokens>(ZeroTokens);
-
-export const useAuthTokens = (): AuthTokens => {
-  const context = React.useContext(AuthTokenContext);
-  if (!context) {
-    throw Error("Attempted to use AuthTokens without a provider!");
-  }
-  return context;
-};
-
 /**
- * Auth Actions
+ * Combined Auth Context with all values
  */
-interface AuthActions {
-  setLoggedIn: (tokens: AuthTokens) => Promise<void>;
-  logout: () => void;
-  processAuthCallback: () => Promise<void>;
+interface AuthContextValue {
+  // Auth state
+  authState: AuthState;
+  // Auth tokens
+  tokens: AuthTokens;
+  // Client credentials state
+  clientCredentialsToken: string | null;
+  isClientCredentialsLoading: boolean;
 }
 
-const AuthActionContext = React.createContext<AuthActions | undefined>(
+const AuthContext = React.createContext<AuthContextValue | undefined>(
   undefined
 );
 
-export const useAuthActions = (): AuthActions => {
-  const context = React.useContext(AuthActionContext);
-  if (!context) {
-    throw Error("Attempted to use AuthActions without a provider!");
-  }
-  return context;
-};
+/**
+ * Combined Auth Actions Context with all actions
+ */
+interface AuthActionsContextValue {
+  // Regular auth actions
+  setLoggedIn: (tokens: AuthTokens) => Promise<void>;
+  logout: () => void;
+  processAuthCallback: () => Promise<void>;
+  // Client credentials actions
+  getClientCredentialsToken: () => Promise<string>;
+}
+
+const AuthActionsContext = React.createContext<
+  AuthActionsContextValue | undefined
+>(undefined);
 
 // Helper to clear auth cookies
 const clearCookies = () => {
   document.cookie = "spotify_access_token=; Max-Age=0; path=/; samesite=lax";
   document.cookie = "spotify_refresh_token=; Max-Age=0; path=/; samesite=lax";
   document.cookie = "spotify_token_expiry=; Max-Age=0; path=/; samesite=lax";
+};
+
+// Hook to access auth values
+export const useAuth = (): AuthContextValue => {
+  const context = React.useContext(AuthContext);
+  if (!context) {
+    throw Error("Attempted to use AuthContext without a provider!");
+  }
+  return context;
+};
+
+// Hook to access auth actions
+export const useAuthActions = (): AuthActionsContextValue => {
+  const context = React.useContext(AuthActionsContext);
+  if (!context) {
+    throw Error("Attempted to use AuthActionsContext without a provider!");
+  }
+  return context;
+};
+
+// Convenience hooks for common use cases
+export const useAuthState = (): AuthState => {
+  return useAuth().authState;
+};
+
+export const useAuthTokens = (): AuthTokens => {
+  return useAuth().tokens;
 };
 
 /**
@@ -92,6 +115,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = React.memo(
     const [authState, setAuthState] = React.useState<AuthState>(UnknownState);
     const [authTokens, setAuthTokens] = React.useState<AuthTokens>(ZeroTokens);
     const router = useRouter();
+
+    const [clientCredentialsToken, setClientCredentialsToken] = useState<
+      string | null
+    >(null);
+    const [clientCredentialsExpiry, setClientCredentialsExpiry] = useState<
+      number | null
+    >(null);
+    const [isClientCredentialsLoading, setIsClientCredentialsLoading] =
+      useState(false);
+
+    // Change from useState to useRef
+    const hasAttemptedClientCredentialsRef = React.useRef(false);
 
     const { initialize: initializeSpotify, teardown: teardownSpotify } =
       useSpotifyActions();
@@ -168,10 +203,109 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = React.memo(
       }
     }, [setLoggedIn]);
 
+    // Add a new method to initialize SDK with just client credentials
+    const initializeWithClientCredentials = React.useCallback(
+      async (accessToken: string) => {
+        try {
+          console.log("Initializing Spotify with client credentials only");
+
+          // Call the initializeSpotify function with only the access token
+          await initializeSpotify({
+            access_token: accessToken,
+            // No refresh token provided for client credentials flow
+          });
+
+          setAuthState(BrowseOnlyState);
+        } catch (e) {
+          console.error(
+            "Failed to initialize Spotify with client credentials:",
+            e
+          );
+          logout();
+        }
+      },
+      [initializeSpotify, logout]
+    );
+
+    const getClientCredentialsToken = useCallback(async (): Promise<string> => {
+      // Check if we have a valid token already
+      if (
+        clientCredentialsToken &&
+        clientCredentialsExpiry &&
+        Date.now() < clientCredentialsExpiry
+      ) {
+        return clientCredentialsToken;
+      }
+
+      setIsClientCredentialsLoading(true);
+      try {
+        const response = await fetch("/api/spotify/client-credentials");
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(
+            error.error || "Failed to get client credentials token"
+          );
+        }
+
+        const data = await response.json();
+        const expiryTime = Date.now() + data.expires_in * 1000;
+
+        setClientCredentialsToken(data.access_token);
+        setClientCredentialsExpiry(expiryTime);
+
+        // If we're in an unknown or logged out state, initialize SDK with client credentials
+        if (authState === UnknownState || authState === LoggedOutState) {
+          setAuthState(BrowseOnlyState);
+          await initializeWithClientCredentials(data.access_token);
+        }
+
+        return data.access_token;
+      } catch (error) {
+        console.error("Error getting client credentials token:", error);
+        throw error;
+      } finally {
+        setIsClientCredentialsLoading(false);
+      }
+    }, [
+      clientCredentialsToken,
+      clientCredentialsExpiry,
+      authState,
+      initializeWithClientCredentials,
+    ]);
+
+    // Function to handle getting client credentials as fallback
+    const getClientCredentialsFallback = React.useCallback(
+      async (errorContext: string = "general"): Promise<boolean> => {
+        // Skip if we've already tried
+        if (hasAttemptedClientCredentialsRef.current) {
+          console.log(
+            "Already attempted client credentials, skipping fallback"
+          );
+          return false;
+        }
+
+        hasAttemptedClientCredentialsRef.current = true;
+        try {
+          await getClientCredentialsToken();
+          return true;
+        } catch (credError) {
+          console.error(
+            `Failed to get client credentials (${errorContext}):`,
+            credError
+          );
+          logout();
+          return false;
+        }
+      },
+      [getClientCredentialsToken, logout]
+    );
+
     // Check authentication status on mount
     React.useEffect(() => {
       const checkAuthStatus = async () => {
         setAuthState(LoadingState);
+        hasAttemptedClientCredentialsRef.current = false; // Reset flag on each check
 
         try {
           // Check if we have tokens in localStorage
@@ -182,38 +316,37 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = React.memo(
               console.log("Tokens found in localStorage, verifying...");
 
               // Refresh the token to make sure it's valid
-              try {
-                const response = await fetch("/api/spotify/refresh", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                  },
-                  body: JSON.stringify({ refreshToken: tokens.refresh_token }),
-                });
+              const response = await fetch("/api/spotify/refresh", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ refreshToken: tokens.refresh_token }),
+              });
 
-                if (!response.ok) {
-                  throw new Error("Failed to refresh token");
-                }
-
-                const data = await response.json();
-                await setLoggedIn({
-                  access_token: data.access_token,
-                  refresh_token: tokens.refresh_token,
-                });
-                return;
-              } catch (error) {
-                console.error("Failed to refresh token:", error);
-                logout();
-                return;
+              if (!response.ok) {
+                throw new Error("Failed to refresh token");
               }
-            }
-          }
 
-          // If we get here, user is not authenticated
-          setAuthState(LoggedOutState);
+              const data = await response.json();
+              await setLoggedIn({
+                access_token: data.access_token,
+                refresh_token: tokens.refresh_token,
+              });
+            }
+          } else {
+            // If we get here, user is not authenticated with tokens
+            // Try to get client credentials as fallback
+            await getClientCredentialsFallback("no auth tokens");
+          }
         } catch (error) {
           console.error("Error checking auth status:", error);
-          setAuthState(LoggedOutState);
+          // Try client credentials as a last resort, but only if we haven't tried already
+          if (!hasAttemptedClientCredentialsRef.current) {
+            await getClientCredentialsFallback("auth status check");
+          } else {
+            logout();
+          }
         }
       };
 
@@ -221,13 +354,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = React.memo(
         console.log("Auth state is unknown, checking status...");
         checkAuthStatus();
       }
-    }, [authState, logout, setLoggedIn]);
+    }, [
+      authState,
+      logout,
+      setLoggedIn,
+      getClientCredentialsToken,
+      getClientCredentialsFallback,
+      // No need to include hasAttemptedClientCredentialsRef in dependencies
+    ]);
 
-    // Create auth actions object
-    const authActions: AuthActions = React.useMemo(
-      () => ({ setLoggedIn, logout, processAuthCallback }),
-      [setLoggedIn, logout, processAuthCallback]
-    );
+    // Create a combined context value object
+    const authContextValue: AuthContextValue = {
+      authState,
+      tokens: authTokens,
+      clientCredentialsToken,
+      isClientCredentialsLoading,
+    };
+
+    // Create a combined actions object
+    const authActionsValue: AuthActionsContextValue = {
+      setLoggedIn,
+      logout,
+      processAuthCallback,
+      getClientCredentialsToken,
+    };
+
+    console.log("Auth state:", authState);
 
     // Don't render children until we know the auth state
     if (authState === UnknownState || authState === LoadingState) {
@@ -235,13 +387,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = React.memo(
     }
 
     return (
-      <AuthStateContext.Provider value={authState}>
-        <AuthTokenContext.Provider value={authTokens}>
-          <AuthActionContext.Provider value={authActions}>
-            {children}
-          </AuthActionContext.Provider>
-        </AuthTokenContext.Provider>
-      </AuthStateContext.Provider>
+      <AuthContext.Provider value={authContextValue}>
+        <AuthActionsContext.Provider value={authActionsValue}>
+          {children}
+        </AuthActionsContext.Provider>
+      </AuthContext.Provider>
     );
   }
 );

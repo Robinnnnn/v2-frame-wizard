@@ -30,14 +30,14 @@ export const useSpotifyState = (): SpotifyState => {
   return context;
 };
 
-type InitSpotifySDKParams = {
+export type InitSpotifySDKParams = {
   access_token: string;
-  refresh_token: string;
+  refresh_token?: string;
 };
 
 type InitializedSpotifySDK = {
   sdk: SpotifySDK.SpotifyWebApiJs;
-  refreshTokenIntervalId: number;
+  refreshTokenIntervalId?: number;
 };
 
 export type InitializedPlaybackSDK = {
@@ -78,27 +78,29 @@ export const SpotifyProvider: React.FC<{ children: React.ReactNode }> =
         const { sdk, refreshTokenIntervalId }: InitializedSpotifySDK =
           initializeSpotifySDK(initParams);
 
-        try {
-          const playbackSdk: InitializedPlaybackSDK =
-            await initializeWebPlaybackSDK({
-              refresh_token,
+        if (refresh_token && refreshTokenIntervalId) {
+          try {
+            const playbackSdk: InitializedPlaybackSDK =
+              await initializeWebPlaybackSDK({
+                refresh_token,
+                sdk,
+              });
+
+            const user: SpotifyApi.CurrentUsersProfileResponse =
+              await sdk.getMe();
+
+            console.log(`Retrieved user: ${user.id}`);
+            setSpotifyState({
               sdk,
+              refreshTokenIntervalId,
+              player: playbackSdk.player,
+              playbackInstance: playbackSdk.playbackInstance,
+              user,
             });
-
-          const user: SpotifyApi.CurrentUsersProfileResponse =
-            await sdk.getMe();
-
-          console.log(`Retrieved user: ${user.id}`);
-          setSpotifyState({
-            sdk,
-            refreshTokenIntervalId,
-            player: playbackSdk.player,
-            playbackInstance: playbackSdk.playbackInstance,
-            user,
-          });
-        } catch (e) {
-          console.error(`Failed to initialize spotify:`, e);
-          throw e;
+          } catch (e) {
+            console.error(`Failed to initialize spotify:`, e);
+            throw e;
+          }
         }
       },
       []
